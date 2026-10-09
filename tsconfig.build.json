@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    // src/ isn't shipped (plan §10: files = [dist, README, LICENSE]), so embed
+    // the sources in the maps — otherwise published maps point at missing files.
+    "inlineSources": true
+  },
+  "include": ["src"]
+}

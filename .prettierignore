@@ -1,0 +1,6 @@
+plan.md
+dist/
+node_modules/
+coverage/
+package-lock.json
+*.tsbuildinfo
