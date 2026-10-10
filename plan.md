@@ -170,15 +170,48 @@ Every **mutating** tool runs this **before** touching Discord. Layered checks:
    for the exact required flags (per-channel, overwrite-aware; `Administrator` short-circuits).
 3. **Role hierarchy**
    - bot top-role position vs **target role** position (edit/delete role, assign role, reorder),
-   - bot top-role position vs **target member's highest role** (kick/timeout/nick/roles/voice),
-   - target member's top role vs **actor** — a moderator above Warden can't be touched by Warden,
+   - bot top-role position vs **target member's highest role** (kick/timeout/nick/roles/voice);
+     the same comparison also forbids touching anyone whose own highest role sits above Warden's,
    - cannot edit `@everyone` or managed/integration roles, cannot reorder below 0,
    - cannot act on the **guild owner** (kick/ban/nick/timeout),
-   - cannot timeout/ban users **with Administrator** (Discord rejects),
+   - cannot timeout/ban users **with Administrator** (Discord rejects the timeout half;
+     the ban half is Warden policy, stricter than the API — see the clarification below),
    - cannot grant **permissions Warden itself lacks** (`ManageRoles` grant rule).
 4. **Structural limits** — bulk-delete range (2–100, ≤ 2 weeks), prune dry-run first,
    slowmode 0–21600, timeout ≤ 28 days, emoji/sticker/soundboard file limits, thread archive
    durations, forum tag rules, etc.
+
+> **Phase 3 clarifications**, recorded while implementing `guards.ts`:
+>
+> * `@everyone` and managed roles are refused for **every** caller, including a
+>   guild-owner bot. The `@everyone` half is deliberately *stricter* than the API —
+>   `Modify Guild Role` requires only `MANAGE_ROLES`, and because `@everyone` sits at the
+>   bottom of the role list every bot with a real top role is above it. Warden refuses it
+>   anyway so an agent's plan never has to branch on guild ownership. The managed half is
+>   the opposite kind of rule: Discord itself refuses those for everyone.
+> * No guild-owner exemption from the *position* rule. An earlier draft of this block
+>   claimed one and cited a `compute_role_hierarchy` helper that exists nowhere in
+>   discord.js 14.27. Discord's own Permission Hierarchy docs state the bot rules with no
+>   owner carve-out, and the library agrees on roles — `Role#editable` is `managed → false`,
+>   then `ManageRoles`, then `comparePositionTo(...) > 0`, with no owner branch anywhere.
+>   On members the library *diverges*: `GuildMember#manageable` returns `true` immediately
+>   when the client user owns the guild, so an owner bot skips the position comparison
+>   there. Warden declines to model that divergence — over-refusing hands the agent an
+>   actionable message, under-refusing is the raw 50013 this layer exists to pre-empt.
+>   `Administrator` does **not** lift the position rule, so it remains a reported blocker
+>   even for an admin bot.
+> * The Administrator protection is action-specific, so Warden does not attribute it to
+>   Discord uniformly. Timeout has a real Discord rule: `GuildMember#moderatable` is
+>   `!Administrator && manageable && ModerateMembers`, and the docs for
+>   `communication_disabled_until` say it 403s for an Administrator target. Ban has none —
+>   `bannable` is just `manageable && BanMembers` — so refusing to ban an Administrator is
+>   Warden policy, stricter than the API, in the same family as the `@everyone` refusal
+>   above. Kick never passes the protection at all: `kickable` is hierarchy-only too, so
+>   enabling it there would invent a restriction Discord does not have.
+> * "cannot reorder below 0" is enforced by the `role.reorder` tool in Phase 7, not by this
+>   layer: `Role#position` is recomputed from the cache and is never negative, so there is
+>   no negative position here to observe. The negative value would arrive as the agent's
+>   *requested* index, which belongs to the tool.
 
 Any failure → the structured JSON above (`isError: true`). `errors.ts` is the safety net:
 whatever DiscordAPIError still slips through (50013 Missing Permissions — which is also the code

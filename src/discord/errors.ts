@@ -111,8 +111,14 @@ function scrubSecretSegments(text: string): string {
  * webhook/interaction secrets that TOKEN_LIKE structurally cannot match.
  * Routing all output through one function is what makes the header's "no
  * token survives" claim checkable rather than a promise per call site.
+ *
+ * Exported because a guard can emit raw Discord text — role and channel
+ * names are operator-authored — into a *success* payload, which `ok()`
+ * deliberately does not scrub. Sharing this rather than reaching for
+ * `redact()` alone keeps one choke point: `redact()` would miss a webhook
+ * URL, which is not bot-token shaped and so never matches TOKEN_LIKE.
  */
-function scrub(text: string): string {
+export function scrub(text: string): string {
   return redact(scrubSecretSegments(text));
 }
 
