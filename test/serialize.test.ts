@@ -1,5 +1,5 @@
 /**
- * serialize.ts is the contract between discord.js and every payload the agent
+ * serializers/ is the contract between discord.js and every payload the agent
  * ever sees, so these tests deliberately feed it **real constructed discord.js
  * objects** rather than only hand-written fixtures: that is what pins each
  * field name to the library instead of to whatever a fixture happens to
@@ -51,7 +51,7 @@ import {
   serializeUser,
   serializeVoiceState,
   serializeWebhook,
-} from "../src/discord/serialize.js";
+} from "../src/discord/serializers/index.js";
 
 const ALICE = "100000000000000001";
 const GUILD_ID = "100000000000000002";
@@ -211,7 +211,7 @@ const rawGuild = {
           name: "Visual Studio Code",
           type: 0,
           state: "editing warden",
-          details: "serialize.ts",
+          details: "serializers/",
           application_id: "357940114668354560",
           timestamps: { start: 1700000000000 },
           id: "custom",
@@ -1155,7 +1155,7 @@ describe("serializePresence — real discord.js Presence", () => {
           name: "Visual Studio Code",
           type: 0,
           state: "editing warden",
-          details: "serialize.ts",
+          details: "serializers/",
           url: null,
           applicationId: "357940114668354560",
           startedAt: "2023-11-14T22:13:20.000Z",
@@ -1255,7 +1255,7 @@ describe("plain fixtures", () => {
   it("reports no named flags for a raw APIUser integer", () => {
     // `Webhook.owner` is declared `User | APIUser`, and a raw `APIUser` carries
     // a bare `UserFlags` integer rather than a bit-field object. Naming it
-    // would mean duplicating discord-api-types' enum in serialize.ts, so the
+    // would mean duplicating discord-api-types' enum in the serializers, so the
     // honest answer is "none I can name" rather than a guessed label.
     expect(serializeUser({ id: "1", username: "u", flags: 64 }).flags).toEqual(
       [],

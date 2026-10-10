@@ -14,7 +14,7 @@
  *
  * **`ok()` does not scrub**, and the distinction is deliberate rather than an
  * oversight. Success payloads are meant to be assembled from already-serialized
- * data (`src/discord/serialize.ts`), so the guarantee on that side is
+ * data (`src/discord/serializers/`), so the guarantee on that side is
  * structural: a tool passes through objects the serializers produced, not raw
  * strings it composed. The one guard that *does* return raw Discord text —
  * `blockersFor()`, whose role names are whatever the operator typed —

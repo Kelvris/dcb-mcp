@@ -64,7 +64,15 @@ warden-discord-mcp/
 │   │   ├── client.ts           # Client(all intents), ready-wait, reconnect, ws ping
 │   │   ├── guards.ts           # ★ preflight: permission + hierarchy + structural checks
 │   │   ├── errors.ts           # DiscordAPIError → WardenError JSON (codes 50013, 50001, …)
-│   │   └── serialize.ts        # discord.js objects → compact JSON (stripped/curated)
+│   │   └── serializers/        # discord.js objects → compact JSON (stripped/curated)
+│   │       ├── index.ts        #   the barrel — tools import this, not a single domain
+│   │       ├── shared.ts       #   public primitives (compact, idList, bit-field readers)
+│   │       ├── internal.ts     #   private helpers; deliberately not re-exported
+│   │       ├── members.ts      #   users, members, roles
+│   │       ├── channels.ts     #   channels + overwrites, forum tags, default reaction
+│   │       ├── guilds.ts       #   guild + expressions, invites, webhooks, bans
+│   │       ├── messages.ts     #   messages + embeds, attachments, polls
+│   │       └── presence.ts     #   presences, activities, voice states
 │   ├── events/
 │   │   ├── types.ts            # NormalizedEvent, EventFilter, Watch
 │   │   ├── normalize.ts        # every ClientEvent → NormalizedEvent
@@ -279,7 +287,7 @@ accepts both wire names and discord.js names so filters read naturally.
   "authorId": "…", "data": { /* compact payload: ids + content + key fields, no raw blobs */ } }
 ```
 
-`serialize.ts` curates payload size: full objects for small ones (role, emoji, invite),
+`serializers/` curates payload size: full objects for small ones (role, emoji, invite),
 trimmed for big ones (message keeps id/content/author/attachments/embeds summary/mentions;
 member keeps id/user/roles/nick/joinedAt; voice state keeps full triple).
 
@@ -528,7 +536,7 @@ you say so.
 | # | Phase | Deliverables | Done when |
 |---|---|---|---|
 | 1 | **Scaffold** | package.json, tsconfig (strict/NodeNext), eslint, vitest, .gitignore, LICENSE (MIT), .env.example, logger.ts, config.ts | `npm run typecheck` passes on empty skeleton |
-| 2 | **Discord core** | `discord/client.ts` (all intents, ready-wait, ping), `errors.ts`, `serialize.ts` | unit tests for errors pass; client connects with real token |
+| 2 | **Discord core** | `discord/client.ts` (all intents, ready-wait, ping), `errors.ts`, `serializers/` | unit tests for errors pass; client connects with real token |
 | 3 | **Guards** | `guards.ts` full preflight matrix + `shared/result.ts` | guard matrix tests green |
 | 4 | **MCP skeleton** | `server.ts`, `index.ts`, `serveStdio`, tools `get_bot_status` + `get_server` | `npx` run in opencode shows status tool working |
 | 5 | **Event system** | `events/*` (normalize all 67, bus, watches) + observe tools (7) | bus/watch/normalize tests green; live message appears in `read_watch` |
