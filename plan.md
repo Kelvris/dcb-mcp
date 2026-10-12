@@ -152,6 +152,96 @@ index.ts ── zod-parse env ──► createWarden()
 * Shutdown: SIGINT/SIGTERM → destroy client → flush → exit 0.
 * discord.js auto-handles rate limits & reconnects; we surface `ws.ping` and `status` in `get_bot_status`.
 
+> **Phase 4 implementation notes**, recorded while building `server.ts`/`index.ts` and the
+> first two tools:
+>
+> * `get_bot_status` is the one tool that **succeeds while the gateway is down**: it answers
+>   `ok:true` with `ready:false` and a note, instead of `not_ready`. It is the diagnostic
+>   tool — reporting the state *is* its job — and the `not_ready` failure belongs to the
+>   tools that actually need Discord. Every other tool keeps the plan's rule.
+> * Neither phase-4 tool declares an `outputSchema`. The uniform envelope travels as
+>   `content[0].text` (the payload as JSON) **plus the same object as `structuredContent`**;
+>   the SDK validates structured content only when a schema is declared, so declaring one
+>   would freeze the envelope's shape for a tool whose data is deliberately open —
+>   uniformity comes from the §5 contract, applied in one place (`tools/context.ts`), not
+>   from 60 per-tool schemas.
+> * The version reported in the MCP handshake is read from the installed `package.json` at
+>   startup: `dist/server.js` and `src/server.ts` both sit one directory below the package
+>   root, so one relative URL resolves in dev, in the published tarball, and under `npx`.
+>   An unreadable file degrades to a placeholder rather than taking startup down over a
+>   cosmetic field.
+> * Shutdown gained a **stdin trigger** alongside SIGINT/SIGTERM. The stdio transport closes
+>   itself when the client ends stdin, but the Discord gateway socket keeps the event loop
+>   alive — without the explicit exit the process outlives its client as a zombie.
+> * A bad token never reaches `login()`'s promise the way a naive reading suggests: discord.js
+>   fails during *connect* (`TokenInvalid`), so `createWarden()` treats login as
+>   fire-and-forget and logs the mapped remediation; tools answer `not_ready` meanwhile.
+>   Verified live: a bogus token yields `ready:false` from `get_bot_status`, a structured
+>   `not_ready` from `get_server`, and the remediation line on stderr — with the token
+>   absent from both streams.
+>
+> **Re-review notes** (after the Phase 4 review pass), each pinned by a test:
+>
+> * **The MCP server is per connection, not a singleton.** `serveStdio`'s factory runs on
+>   every connection *phase* — a 2025-era opening probe can be discarded and re-served
+>   through the legacy path — and `Server.connect` requires a separate instance per
+>   connection. `Warden.createServer()` therefore builds and registers a fresh server
+>   each call; the Discord client, config, logger (and later the event bus) are the
+>   shared state built once in `createWarden()`.
+> * **Exit flushes stderr first.** A client captures our stderr over a pipe, and Node
+>   treats pipe writes as *asynchronous* on macOS — `process.exit()` can drop the last
+>   diagnostic lines, so shutdown awaits a drain callback before exiting (this is the
+>   "flush" §5 already promised). A repeat signal or a crash arriving mid-shutdown now
+>   forces a **non-zero** exit instead of being swallowed by the in-progress guard.
+> * **`get_bot_status` distinguishes "connecting" from "can never connect".**
+>   `WardenDiscord.status()` now publishes the client's fatal latch (reason +
+>   remediation), and the tool turns it into a note that names the fix — a reset token no
+>   longer reads "call again in a few seconds" forever while the real answer sits on stderr.
+> * **`ToolContext.config` is `Omit<Config, "DISCORD_BOT_TOKEN">`** — the tool layer
+>   cannot name the secret at compile time (plan §4), and operator-authored free text in
+>   *success* payloads (guild name/description, channel name/topic) goes through
+>   `scrubText()` because `ok()` deliberately does not scrub.
+> * One snowflake definition (`src/shared/ids.ts`, plan §3) now backs both the env
+>   validator and every `*_id` tool input.
+>
+> **Third-pass notes** (shutdown hardening after the process-level review), each pinned
+> by `test/shutdown.test.ts` or `test/process.test.ts`:
+>
+> * The shutdown orchestration lives in `src/shutdown.ts` (injectable hooks), because
+>   the trigger rules are exactly where bugs hide and they must be unit-testable.
+>   Escalation rule: a repeat *signal* or a *crash* during teardown forces a non-zero
+>   exit, but a signal during a **client-initiated** (stdin) teardown does not — the
+>   client is already gone, so that pass finishes normally (exit 0).
+> * `process.stderr`/`process.stdout` get no-op `'error'` sinks in `index.ts`: a client
+>   that closes its captured-stderr pipe would otherwise turn every log line (including
+>   the uncaughtException handler's own output) into EPIPE — a self-sustaining loop that
+>   never reaches the exit. `test/process.test.ts` reproduces it end to end.
+> * `flushStderr` always writes the barrier (no `writableLength === 0` fast path — a
+>   write already handed to the OS leaves the queue empty while its bytes are still in
+>   flight) and is bounded at 500 ms; closing the transport is likewise raced against a
+>   5 s bound so a wedged pipe cannot strand the gateway teardown.
+> * `test/process.test.ts` spawns the built `dist/index.js` (self-rebuilding through
+>   `npm run build` when stale), performs a real MCP initialize handshake, and asserts
+>   exit 0 — no "forcing exit" line, token in no stream — for both the stdin-EOF and the
+>   stderr-gone scenarios.
+>
+> **Fourth-pass notes** (escalation matrix completed; review verdict APPROVE WITH FIXES):
+>
+> * Absorptions are granted in **either** trigger order — at most one per teardown: the
+>   first signal during a client-initiated (stdin) teardown, *or* a client disconnect
+>   arriving during a signal teardown (`docker stop` / `systemd KillMode=mixed` signal
+>   first, close stdin right after). The second signal always escalates — the
+>   wedged-teardown escape hatch survives the absorption — and a crash always exits
+>   non-zero.
+> * A broken stdout is treated as "the client is gone": it routes through the same
+>   deduplicated client-gone trigger as stdin EOF. The stream-error sinks absorb only
+>   reader-gone codes (`EPIPE` and friends) and report anything else (full disk, bad fd)
+>   once, so a persistently broken stream can neither loop nor fail silently.
+> * The transport-close bound's timer is cleared when the transport wins the race, and
+>   `flushStderr` resolves (never rejects) even if `write` throws synchronously — a
+>   rejection there would surface as an unhandled rejection and force exit 1 on an
+>   otherwise clean disconnect.
+
 ### Result contract (uniform for every tool)
 
 ```jsonc

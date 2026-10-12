@@ -14,9 +14,7 @@
 
 import { z } from "zod";
 import { LOG_LEVELS, redact } from "./logger.js";
-
-/** Discord ids are 17–20 digit snowflakes (length grew over the years). */
-const SNOWFLAKE = /^\d{17,20}$/;
+import { SNOWFLAKE } from "./shared/ids.js";
 
 function snowflake(label: string): z.ZodString {
   const message = `${label} must be a Discord snowflake id (17-20 digits)`;

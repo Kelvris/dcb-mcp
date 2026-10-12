@@ -28,7 +28,7 @@ import {
 import type { ClientOptions } from "discord.js";
 
 import type { Logger } from "../logger.js";
-import { WardenNotReadyError } from "./errors.js";
+import { toWardenError, WardenNotReadyError } from "./errors.js";
 
 /**
  * Every non-deprecated GatewayIntentBits value (plan §7.1 lists all 21 by
@@ -132,6 +132,17 @@ export interface WardenDiscordStatus {
   disconnects: number;
   /** Last unrecoverable close code, if any. */
   lastCloseCode: number | null;
+  /**
+   * Non-null once this connection can **never** become ready (invalid/reset
+   * token, privileged intents not enabled, destroyed client) — with the
+   * operator-facing fix, not just the reason.
+   *
+   * This is what lets `get_bot_status` distinguish "still connecting, retry"
+   * from "this will never connect": without it a bad token reports
+   * `ready:false` forever while the remediation sits only on stderr.
+   * `ready` is `false` whenever this is non-null.
+   */
+  fatal: { reason: string; remediation: string } | null;
 }
 
 export interface WardenDiscord {
@@ -170,12 +181,16 @@ export function createWardenDiscord(logger: Logger): WardenDiscord {
   let lastCloseCode: number | null = null;
   /**
    * Non-null once Warden knows this client can *never* become ready — it was
-   * destroyed, or `login()` failed. discord.js calls `destroy()` internally
-   * when a login fails, but that never touches our state, so without this a
-   * `waitForReady()` issued after a bad token would block for its full timeout
-   * instead of failing at once — the unbounded hang the header promises away.
+   * destroyed, or `login()` failed, or the gateway closed unrecoverably. Each
+   * entry carries the reason *and* the operator-facing remediation, because
+   * `status()` publishes this (and `get_bot_status` reads it): an agent must
+   * be able to tell "retry in a few seconds" from "fix your token first".
+   * discord.js calls `destroy()` internally when a login fails, but that
+   * never touches our state, so without this a `waitForReady()` issued after
+   * a bad token would block for its full timeout instead of failing at once —
+   * the unbounded hang the header promises away.
    */
-  let fatal: string | null = null;
+  let fatal: { reason: string; remediation: string } | null = null;
   const pending = new Set<PendingWaiter>();
 
   function rejectPending(reason: Error): void {
@@ -235,7 +250,12 @@ export function createWardenDiscord(logger: Logger): WardenDiscord {
     // latch a later `waitForReady()` would burn its whole timeout and then
     // report "did not become ready", hiding the close code we already know.
     const reason = `Discord gateway closed with code ${event.code} before ready.`;
-    fatal = reason;
+    fatal = {
+      reason,
+      remediation:
+        UNRECOVERABLE_CLOSE_REMEDIATION[event.code] ??
+        "Check the WARDEN_LOG_LEVEL=debug stderr output for context.",
+    };
     rejectPending(new WardenNotReadyError(reason));
   });
 
@@ -267,7 +287,7 @@ export function createWardenDiscord(logger: Logger): WardenDiscord {
       // failure should be reported ahead of a transient "not ready yet": a
       // reader of this function sees why it can never succeed before seeing
       // the path where it still might.
-      if (fatal !== null) return Promise.reject(new WardenNotReadyError(fatal));
+      if (fatal !== null) return Promise.reject(new WardenNotReadyError(fatal.reason));
       if (ready()) return Promise.resolve();
       return new Promise<void>((resolve, reject) => {
         const waiter: PendingWaiter = {
@@ -305,6 +325,7 @@ export function createWardenDiscord(logger: Logger): WardenDiscord {
         reconnects,
         disconnects,
         lastCloseCode,
+        fatal: fatal === null ? null : { ...fatal },
       };
     },
 
@@ -318,17 +339,27 @@ export function createWardenDiscord(logger: Logger): WardenDiscord {
       } catch (error) {
         // The error itself carries no token; toWardenError() maps
         // TokenInvalid (discord.js) and 401 (REST) to the token remediation.
-        fatal =
-          "Discord login failed — the client never reached the ready state.";
-        rejectPending(new WardenNotReadyError(fatal));
+        // Carrying that remediation on the latch (rather than only in the log
+        // line) is what lets get_bot_status tell an agent *why* this will
+        // never connect — see the `fatal` field on WardenDiscordStatus.
+        const mapped = toWardenError(error);
+        fatal = {
+          reason:
+            "Discord login failed — the client never reached the ready state.",
+          remediation: mapped.remediation,
+        };
+        rejectPending(new WardenNotReadyError(fatal.reason));
         log.error("Discord login failed", { error });
         throw error;
       }
     },
 
     async destroy(): Promise<void> {
-      fatal = "The Discord client was destroyed before ready.";
-      rejectPending(new WardenNotReadyError(fatal));
+      fatal = {
+        reason: "The Discord client was destroyed before ready.",
+        remediation: "Warden is shutting down — restart it to reconnect.",
+      };
+      rejectPending(new WardenNotReadyError(fatal.reason));
       await client.destroy();
       log.info("Discord client destroyed");
     },
