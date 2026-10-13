@@ -241,6 +241,90 @@ index.ts ── zod-parse env ──► createWarden()
 >   `flushStderr` resolves (never rejects) even if `write` throws synchronously — a
 >   rejection there would surface as an unhandled rejection and force exit 1 on an
 >   otherwise clean disconnect.
+>
+> **Phase 5 implementation notes** (the event system — `events/*` + the six observe tools):
+>
+> * **69 event specs = §7.2's inventory exactly** (count canary pinned in
+>   `normalize.test.ts`; §12's "~67" rounds the table). Intentionally *not* subscribed:
+>   `userUpdate` and entitlement events (not in §7.2), the deprecated `ready` spelling
+>   (only `clientReady` → type `ready`, so READY is captured once) and deprecated
+>   `webhooksUpdate`'s old name (`webhooksUpdate` itself is subscribed — it *is* the
+>   inventory entry).
+> * **Eight inventory events are captured from `Events.Raw`, not from discord.js**
+>   because discord.js 14 never emits them: `applicationCommandCreate/Update/Delete`,
+>   `integrationCreate/Update/Delete`, `voiceChannelStatusUpdate`,
+>   `voiceChannelStartTimeUpdate`. The raw dispatch fires for *every* gateway packet
+>   before handling, so the backstop is a single listener keyed by wire name — the
+>   inventory is complete without waiting on the library.
+> * **Canonical type = discord.js' camelCase listener name**, with two meta renames
+>   (`READY` → `ready`, `shardResume`/`RESUMED` → `resumed`) and five wire aliases where
+>   the library renamed the wire event (`GUILD_ROLE_*` → `role*`, `GUILD_EMOJIS_UPDATE`
+>   → `emojiUpdate`, `GUILD_STICKERS_UPDATE` → `stickerUpdate`). `canonicalType()` at the
+>   tool boundary accepts either spelling, so filters read the same either way (§7.2's
+>   closing note).
+> * **Scrub happens once, at ingest**: `bus.push()` deep-scrubs every payload string
+>   before the event enters the ring. Message bodies, audit reasons and topics are
+>   operator/user free text — exactly where a pasted token lives (§4) — and one choke
+>   point means every consumer (tools, watches, waits, later phases) can echo stored
+>   events verbatim without re-scrubbing.
+> * **Unknown type names in a filter are `invalid_input`, never a silent empty result**:
+>   a typo that matches nothing forever is indistinguishable from "no activity".
+>   Wildcard prefixes are validated the same way (`xyz*` is rejected, `message*` passes).
+>   `since_seq` and `since` together are also `invalid_input` — one cursor style at a
+>   time (§8.1 documents both as alternatives).
+> * **`get_events` has two read modes**: without a bound it returns the *tail* (newest
+>   `limit`, oldest-first); with `since_seq`/`since` it pages forward ascending. A
+>   wall-clock `since` is converted to a seq cursor first (`bus.cursorFor`), so paging
+>   from it never skips the middle of a busy window the way a tail pull would.
+> * **Watch lifecycle decisions**: the name *is* the `watch_id` (no id→name lookup to
+>   get wrong); duplicate names are `invalid_input` (never silently replace a session
+>   mid-read); reaching `WARDEN_MAX_WATCHES` is `invalid_input` with the env var named —
+>   §9 has no capacity kind, so `invalid_input` + remediation is the documented fit;
+>   expiry is lazy (30 min since last read, pruned on registry operations — no timer to
+>   outlive its watch); an expired watch reads `not_found` with "create it again".
+>   A fresh watch starts at the current head (future-only) unless `since_*` is given,
+>   in which case the bound lives inside the filter and the first read returns the
+>   matching buffered slice (§8.1's "initial cursor").
+> * **`wait_for_event` is future-only** by construction (matches must have seq > the
+>   call-time head) — history is `get_events`' job; timeout answers
+>   `ok:true {timeout:true, event:null}` rather than a failure, because "nothing
+>   happened" is a valid result.
+> * **Event tools succeed while the gateway is down**, like `get_bot_status`: they read
+>   process-local state, so failing them would break an agent following a watch through
+>   a reconnect for no reason. Each adds a note saying the gateway is down instead;
+>   `not_ready` stays reserved for tools that need Discord (§5's rule, unchanged).
+> * **Annotations follow §8.1's legend**: `readOnlyHint:true` on the five 🟢 tools
+>   (including `watch`/`read_watch`, which advance a process-local cursor but never
+>   touch Discord), `false` only on `unwatch` (🔴*), and `openWorldHint:false` on all
+>   six — no tool in this group performs server-side actions.
+> * **§7.4's partial rule drives every extractor**: `?? null` reads throughout, so an
+>   uncached `messageDelete`, a stripped thread member or an unavailable guild still
+>   yields "id + whatever Discord gave us". Extraction failures are contained per event
+>   (logged as type + error only — never the payload) so one shape discord.js changed
+>   cannot take the pipeline down.
+>
+> **Phase 5 re-review notes** (after the review pass, each pinned by a test):
+>
+> * **`read_watch` reports ring eviction** (`evictedCount` → note): a busy guild can
+>   push past `WARDEN_MAX_EVENTS` between two reads, and a silently truncated "live
+>   follow" is exactly the failure §7.4's anti-hammering design must not have. `get_events`
+>   already noted the buffer horizon; watches now do too.
+> * **Wire-prefixed wildcards expand** — `GUILD_ROLE*`/`GUILD_EMOJIS*` camel-case to
+>   nothing, so they resolve by matching every *wire* name under the prefix to its
+>   canonical type (`GUILD_ROLE*` → `roleCreate roleUpdate roleDelete`). An agent
+>   transcribing §7.2's own wire table is not rejected for the plan's spelling.
+> * **`targetId` is reserved for subjects no other field names** (types.ts's promise):
+>   channel/guild/stage-instance events no longer set it — their subject is already
+>   `channelId`/`guildId`. Role/member/ban/sound/emoji/sticker/scheduled-event/automod-rule/
+>   integration/application-command events keep it.
+> * **`filter` echoes come back snake_case** (`watch`, `list_watches`), matching the input
+>   schema, so an agent can round-trip a listed filter into a `filter` argument verbatim —
+>   with the `since_seq`/`since` bounds travelling as top-level siblings of `filter`,
+>   exactly where the input takes them. Eviction reporting covers a since-based watch's
+>   *first* read too (a cursor-0 watch over a wrapped ring), not just mid-follow gaps.
+> * Automod **rule** events carry `guildId` (`rule.guild`) — the family is guild-scoped,
+>   and a `guild_id` filter must see it. Scrubbing at ingest also covers the stamped id
+>   fields, not just `data`, so no future extractor can bypass the §4 choke point.
 
 ### Result contract (uniform for every tool)
 

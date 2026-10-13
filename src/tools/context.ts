@@ -25,6 +25,7 @@ import { z } from "zod";
 import type { WardenDiscord } from "../discord/client.js";
 import { scrub } from "../discord/errors.js";
 import type { Config } from "../config.js";
+import type { EventRuntime } from "../events/index.js";
 import type { Logger } from "../logger.js";
 import { SNOWFLAKE } from "../shared/ids.js";
 import type { ToolResult } from "../shared/result.js";
@@ -42,6 +43,12 @@ export interface ToolContext {
   readonly config: Omit<Config, "DISCORD_BOT_TOKEN">;
   readonly logger: Logger;
   readonly discord: WardenDiscord;
+  /**
+   * The event buffer and watch sessions (plan §7). Process-local state —
+   * event tools read it without touching Discord, which is why they keep
+   * answering while the gateway is down (see `observe.ts`).
+   */
+  readonly events: EventRuntime;
 }
 
 /**

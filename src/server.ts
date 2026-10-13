@@ -19,6 +19,7 @@ import type { Config } from "./config.js";
 import { createWardenDiscord } from "./discord/client.js";
 import type { WardenDiscord } from "./discord/client.js";
 import { toWardenError } from "./discord/errors.js";
+import { createEventRuntime } from "./events/index.js";
 import type { Logger } from "./logger.js";
 import { registerAll } from "./tools/index.js";
 import type { ToolContext } from "./tools/index.js";
@@ -119,7 +120,17 @@ export function createWarden(
   // from this point down the tool layer physically cannot reach the secret
   // (plan §4) — while `discord.login()` below still gets it.
   const { DISCORD_BOT_TOKEN: _token, ...toolConfig } = config;
-  const ctx: ToolContext = { config: toolConfig, logger, discord };
+  // Attached before login (plan §5): the bus must be listening when READY
+  // arrives, and event tools must answer from the buffer immediately.
+  const events = createEventRuntime(
+    discord.client,
+    {
+      maxEvents: config.WARDEN_MAX_EVENTS,
+      maxWatches: config.WARDEN_MAX_WATCHES,
+    },
+    logger,
+  );
+  const ctx: ToolContext = { config: toolConfig, logger, discord, events };
 
   const createServer = (): McpServer => {
     const server = new McpServer({ name: SERVER_NAME, version });

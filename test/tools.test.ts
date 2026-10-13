@@ -18,11 +18,13 @@
  * above it, two channels and a thread.
  */
 
-import type { Client } from "discord.js";
+import type { Client, OmitPartialGroupDMChannel } from "discord.js";
 import {
   Client as DiscordClient,
   ClientUser,
+  Events,
   Guild,
+  Message,
 } from "discord.js";
 import { McpServer } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
@@ -33,10 +35,19 @@ import { WardenNotReadyError } from "../src/discord/errors.js";
 import type { WardenError } from "../src/discord/errors.js";
 import { createLogger } from "../src/logger.js";
 import { registerAll } from "../src/tools/index.js";
+import { createEventRuntime } from "../src/events/index.js";
 import { createWarden } from "../src/server.js";
 import { getServer } from "../src/tools/guild.js";
 import type { ServerOverview } from "../src/tools/guild.js";
 import { getBotStatus } from "../src/tools/observe.js";
+import {
+  createWatch,
+  getEvents,
+  listWatches,
+  readWatch,
+  removeWatch,
+  waitForEvent,
+} from "../src/tools/observe.js";
 import type { BotStatusData } from "../src/tools/observe.js";
 import { scrubText, toCallToolResult } from "../src/tools/context.js";
 import type { ToolContext } from "../src/tools/context.js";
@@ -225,11 +236,20 @@ function makeContext(
   } = {},
 ): ToolContext {
   const client = makeClient();
+  const config =
+    options.config ?? loadConfig({ DISCORD_BOT_TOKEN: "unit-test-token" });
+  const logger = createLogger("error", () => {});
   return {
-    config:
-      options.config ?? loadConfig({ DISCORD_BOT_TOKEN: "unit-test-token" }),
-    logger: createLogger("error", () => {}),
+    config,
+    logger,
     discord: fakeDiscord(client, options.ready ?? true, options.fatal ?? null),
+    // Phase 5: the event runtime over the same client — tests drive it with
+    // `client.emit(...)` exactly as discord.js would dispatch.
+    events: createEventRuntime(
+      client,
+      { maxEvents: config.WARDEN_MAX_EVENTS, maxWatches: config.WARDEN_MAX_WATCHES },
+      logger,
+    ),
   };
 }
 
@@ -269,20 +289,26 @@ function registeredNames(server: McpServer): string[] {
 // registration
 // ---------------------------------------------------------------------------
 
-describe("registerAll — the phase-4 registry", () => {
-  function newServer(): McpServer {
-    const server = new McpServer({ name: "test", version: "0.0.0" });
-    registerAll(server, makeContext());
-    return server;
-  }
+function newServer(): McpServer {
+  const server = new McpServer({ name: "test", version: "0.0.0" });
+  registerAll(server, makeContext());
+  return server;
+}
 
+describe("registerAll — the phase-4/5 registry", () => {
   it("registers exactly the tools this phase ships", () => {
     // A deliberate canary, not a complete-catalog assertion: each later phase
     // adds its domain here (the plan expects ~59–63 tools by Phase 10), and a
     // failure is the prompt to update this list, not to "fix" the test.
     expect(registeredNames(newServer())).toEqual([
       "get_bot_status",
+      "get_events",
       "get_server",
+      "list_watches",
+      "read_watch",
+      "unwatch",
+      "wait_for_event",
+      "watch",
     ]);
   });
 
@@ -306,19 +332,36 @@ describe("registerAll — the phase-4 registry", () => {
 
   it("advertises object input schemas carrying the snowflake pattern", () => {
     const server = newServer();
+    let withGuildId = 0;
     for (const name of registeredNames(server)) {
       const schema = server.toolInputSchemaJson(name) as {
         type?: string;
-        properties?: Record<string, { pattern?: string; description?: string }>;
+        properties?: Record<
+          string,
+          {
+            pattern?: string;
+            description?: string;
+            properties?: Record<string, { pattern?: string; description?: string }>;
+          }
+        >;
       };
       expect(schema.type, `${name} must take an object`).toBe("object");
-      const guildId = schema.properties?.["guild_id"];
-      expect(guildId?.pattern).toBe("^\\d{17,20}$");
-      expect(guildId?.description).toBeTruthy();
+      // `guild_id` appears either directly (get_bot_status, get_server) or
+      // nested in the event filter (get_events, watch, wait_for_event) —
+      // the snowflake pattern must guard both shapes. list_watches /
+      // read_watch / unwatch scope by watch_id, not guild, and take none.
+      const guildId =
+        schema.properties?.["guild_id"] ??
+        schema.properties?.["filter"]?.properties?.["guild_id"];
+      if (guildId === undefined) continue;
+      withGuildId += 1;
+      expect(guildId.pattern, name).toBe("^\\d{17,20}$");
+      expect(guildId.description, name).toBeTruthy();
     }
+    expect(withGuildId).toBeGreaterThanOrEqual(5);
   });
 
-  it("marks both tools read-only", () => {
+  it("marks every tool read-only except the watch-slot mutation", () => {
     const server = newServer();
     const tools = (
       server as unknown as {
@@ -329,7 +372,10 @@ describe("registerAll — the phase-4 registry", () => {
       }
     )._registeredTools;
     for (const name of registeredNames(server)) {
-      expect(tools[name]?.annotations?.readOnlyHint, name).toBe(true);
+      // §8.1's legend: everything in the observe group is 🟢 except
+      // `unwatch` (🔴*, a state change that never touches Discord).
+      const expected = name !== "unwatch";
+      expect(tools[name]?.annotations?.readOnlyHint, name).toBe(expected);
     }
   });
 });
@@ -611,7 +657,332 @@ describe("createWarden", () => {
     const first = warden.createServer();
     const second = warden.createServer();
     expect(first).not.toBe(second);
-    expect(registeredNames(first)).toEqual(["get_bot_status", "get_server"]);
-    expect(registeredNames(second)).toEqual(["get_bot_status", "get_server"]);
+    // Same registry contents as the registration canary above — the factory
+    // must register the full set once per fresh server.
+    expect(registeredNames(first)).toEqual(registeredNames(newServer()));
+    expect(registeredNames(second)).toEqual(registeredNames(newServer()));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// event tools (plan §7/§8.1) — driven through the runtime + real discord.js
+// objects, i.e. the same dispatch path a live gateway uses
+// ---------------------------------------------------------------------------
+
+describe("event tools", () => {
+  /** A real discord.js Message on the fixture's `#general`, as discord.js would deliver it. */
+  function makeMessage(
+    ctx: ToolContext,
+    overrides: { content?: string; channel?: string } = {},
+  ): Message {
+    const guild = ctx.discord.client.guilds.cache.get(GUILD_ID)!;
+    const channel = guild.channels.cache.get(overrides.channel ?? GENERAL)!;
+    return construct<Message>(
+      Message,
+      ctx.discord.client,
+      {
+        id: `${500000000000000000 + Math.floor(Math.random() * 10 ** 12)}`,
+        channel_id: channel.id,
+        guild_id: GUILD_ID,
+        type: 0,
+        author: { id: MEMBER_ID, username: "bob", discriminator: "0" },
+        content: overrides.content ?? "hello from the test",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        edited_timestamp: null,
+        tts: false,
+        mention_everyone: false,
+        mentions: [],
+        mention_roles: [],
+        attachments: [],
+        embeds: [],
+      },
+      channel,
+    );
+  }
+
+  /**
+   * `client.emit` for message events demands `OmitPartialGroupDMChannel<Message>`
+   * (discord.js excludes group-DM channels from dispatch); a guild-channel
+   * fixture message satisfies that at runtime, so the cast localizes the
+   * typing quirk instead of repeating it at every call site.
+   */
+  function emitMessage(ctx: ToolContext, message: Message): void {
+    ctx.discord.client.emit(
+      Events.MessageCreate,
+      message as OmitPartialGroupDMChannel<Message>,
+    );
+  }
+
+  it("delivers a live message to a watch exactly once (plan §12 done-when)", async () => {
+    const ctx = makeContext();
+    const created = createWatch(ctx, { name: "live" });
+    expect(created.ok).toBe(true);
+
+    emitMessage(ctx, makeMessage(ctx));
+
+    const first = expectOk(await readWatch(ctx, { watch_id: "live" })) as {
+      events: { type: string; channelId: string; authorId: string }[];
+      cursor: number;
+      idle: boolean;
+    };
+    expect(first.events).toHaveLength(1);
+    expect(first.events[0]).toMatchObject({
+      type: "messageCreate",
+      channelId: GENERAL,
+      authorId: MEMBER_ID,
+    });
+    expect(first.idle).toBe(false);
+
+    const second = expectOk(await readWatch(ctx, { watch_id: "live" })) as {
+      events: unknown[];
+      idle: boolean;
+    };
+    expect(second.events).toEqual([]);
+    expect(second.idle).toBe(true);
+  });
+
+  it("get_events pulls the tail and pages forward with since_seq", async () => {
+    const ctx = makeContext();
+    for (let i = 0; i < 5; i++) {
+      emitMessage(ctx, makeMessage(ctx));
+    }
+
+    const tail = expectOk(await getEvents(ctx, { limit: 2 })) as {
+      events: { seq: number }[];
+      cursor: number;
+    };
+    // A bounded pull is the tail: newest `limit`, oldest-first.
+    expect(tail.events.map((event) => event.seq)).toEqual([4, 5]);
+    expect(tail.cursor).toBe(5);
+
+    const page = expectOk(
+      await getEvents(ctx, { since_seq: 1, limit: 2 }),
+    ) as { events: { seq: number }[]; cursor: number };
+    expect(page.events.map((event) => event.seq)).toEqual([2, 3]);
+    expect(page.cursor).toBe(3);
+  });
+
+  it("filters by channel and accepts wire type names end-to-end", async () => {
+    const ctx = makeContext();
+    emitMessage(ctx, makeMessage(ctx));
+    // GUILD_ROLE_CREATE arrives library-named (roleCreate); the wire name
+    // in the filter must canonicalize to it (§7.2).
+    ctx.discord.client.emit(
+      Events.GuildRoleCreate,
+      ctx.discord.client.guilds.cache.get(GUILD_ID)!.roles.cache.get(MOD_ROLE)!,
+    );
+
+    const roles = expectOk(
+      await getEvents(ctx, { filter: { types: ["GUILD_ROLE_CREATE"] } }),
+    ) as { events: { type: string; targetId: string }[] };
+    expect(roles.events).toHaveLength(1);
+    expect(roles.events[0]).toMatchObject({
+      type: "roleCreate",
+      targetId: MOD_ROLE,
+    });
+
+    const generalOnly = expectOk(
+      await getEvents(ctx, { filter: { channel_id: GENERAL } }),
+    ) as { events: { type: string }[] };
+    expect(generalOnly.events.map((event) => event.type)).toEqual(["messageCreate"]);
+  });
+
+  it("rejects unknown types and mixed cursors with the standard envelope", async () => {
+    const ctx = makeContext();
+    const unknown = expectFailure(
+      await getEvents(ctx, { filter: { types: ["messageCreated"] } }),
+    );
+    expect(unknown.error).toBe("invalid_input");
+    expect(unknown.remediation).toContain("message*");
+
+    const mixed = expectFailure(
+      await getEvents(ctx, { since_seq: 1, since: "2026-10-01T00:00:00.000Z" }),
+    );
+    expect(mixed.error).toBe("invalid_input");
+    expect(mixed.message).toContain("not both");
+  });
+
+  it("answers not_found for unknown watches and removes known ones", async () => {
+    const ctx = makeContext();
+    expectFailure(await readWatch(ctx, { watch_id: "ghost" }));
+
+    createWatch(ctx, { name: "mod-log" });
+    const listed = expectOk(listWatches(ctx)) as {
+      watches: { watch_id: string; cursor: number }[];
+      count: number;
+    };
+    expect(listed.watches.map((watch) => watch.watch_id)).toEqual(["mod-log"]);
+
+    expectOk(removeWatch(ctx, "mod-log"));
+    expectFailure(await readWatch(ctx, { watch_id: "mod-log" }));
+    expect((expectOk(listWatches(ctx)) as { count: number }).count).toBe(0);
+  });
+
+  it("rejects a duplicate watch name and enforces WARDEN_MAX_WATCHES", async () => {
+    const ctx = makeContext();
+    expectOk(createWatch(ctx, { name: "dup" }));
+    const duplicate = expectFailure(createWatch(ctx, { name: "dup" }));
+    expect(duplicate.error).toBe("invalid_input");
+
+    const capped = makeContext({
+      config: loadConfig({
+        DISCORD_BOT_TOKEN: "unit-test-token",
+        WARDEN_MAX_WATCHES: "1",
+      }),
+    });
+    expectOk(createWatch(capped, { name: "first" }));
+    const full = expectFailure(createWatch(capped, { name: "second" }));
+    expect(full.remediation).toContain("WARDEN_MAX_WATCHES");
+  });
+
+  it("wait_for_event matches only future events", async () => {
+    const ctx = makeContext();
+    // History must not satisfy the wait — that is get_events' job.
+    emitMessage(ctx, makeMessage(ctx));
+    const stale = expectOk(await waitForEvent(ctx, { timeout_ms: 20 })) as {
+      timeout: boolean;
+      event: unknown;
+    };
+    expect(stale).toEqual({ timeout: true, event: null });
+
+    const pending = waitForEvent(ctx, {
+      filter: { channel_id: GENERAL },
+      timeout_ms: 5_000,
+    });
+    setTimeout(() => {
+      emitMessage(ctx, makeMessage(ctx));
+    }, 15);
+    const matched = expectOk(await pending) as {
+      timeout: boolean;
+      event: { type: string; channelId: string };
+    };
+    expect(matched.timeout).toBe(false);
+    expect(matched.event).toMatchObject({
+      type: "messageCreate",
+      channelId: GENERAL,
+    });
+  });
+
+  it("keeps answering while the gateway is down, with a note instead of not_ready", async () => {
+    const ctx = makeContext({ ready: false });
+    const data = expectOk(await getEvents(ctx, {})) as { events: unknown[] };
+    expect(data.events).toEqual([]);
+    const result = await getEvents(ctx, {});
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.notes?.[0]).toMatch(/gateway is not connected/);
+  });
+
+  it("scrubs a token-shaped message body at ingest (plan §4)", async () => {
+    const ctx = makeContext();
+    emitMessage(
+      ctx,
+      makeMessage(ctx, {
+        content:
+          "deploy ABCDEFGHIJKLMNOPQRSTUVWXYZabcd.12345678." +
+          "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF now",
+      }),
+    );
+    const data = expectOk(await getEvents(ctx, {})) as {
+      events: { data: { content: string } }[];
+    };
+    expect(data.events[0]?.data.content).toBe("deploy [redacted-token] now");
+  });
+
+  it("captures the wire events discord.js does not emit (raw backstop)", async () => {
+    const ctx = makeContext();
+    ctx.discord.client.emit(Events.Raw, {
+      t: "VOICE_CHANNEL_STATUS_UPDATE",
+      d: { id: VOICE, guild_id: GUILD_ID, status: "quiet hours" },
+    });
+    const data = expectOk(await getEvents(ctx, {})) as {
+      events: { type: string; channelId: string; data: { status: string } }[];
+    };
+    expect(data.events[0]).toMatchObject({
+      type: "voiceChannelStatusUpdate",
+      channelId: VOICE,
+      data: { status: "quiet hours" },
+    });
+  });
+
+  it("block_ms long-polls until the next matching event", async () => {
+    const ctx = makeContext();
+    createWatch(ctx, { name: "live" });
+    const pending = readWatch(ctx, { watch_id: "live", block_ms: 5_000 });
+    setTimeout(() => {
+      emitMessage(ctx, makeMessage(ctx));
+    }, 15);
+    const data = expectOk(await pending) as { events: { type: string }[]; idle: boolean };
+    expect(data.events).toHaveLength(1);
+    expect(data.idle).toBe(false);
+  });
+
+  it("pages forward from a wall-clock since (tool level)", async () => {
+    const ctx = makeContext();
+    for (let i = 0; i < 3; i++) emitMessage(ctx, makeMessage(ctx));
+
+    const past = expectOk(await getEvents(ctx, { since: "2000-01-01T00:00:00.000Z" })) as {
+      events: { seq: number }[];
+    };
+    expect(past.events.map((event) => event.seq)).toEqual([1, 2, 3]);
+
+    // A `since` after everything buffered reads as an empty, honest tail.
+    const future = expectOk(await getEvents(ctx, { since: "2099-01-01T00:00:00.000Z" })) as {
+      events: unknown[];
+    };
+    expect(future.events).toEqual([]);
+  });
+
+  it("echoes filters in the input's snake_case shape for round-tripping", async () => {
+    const ctx = makeContext();
+    const created = expectOk(
+      createWatch(ctx, {
+        name: "w",
+        filter: { guild_id: GUILD_ID, channel_id: GENERAL },
+        since_seq: 3,
+      }),
+    ) as { filter: Record<string, unknown>; since_seq: number };
+    // `filter` mirrors the filter argument; the since bounds travel as
+    // top-level siblings — both exactly where the input schemas take them,
+    // so the whole echo can be pasted back verbatim.
+    expect(created.filter).toEqual({
+      guild_id: GUILD_ID,
+      channel_id: GENERAL,
+    });
+    expect(created.since_seq).toBe(3);
+
+    const listed = expectOk(listWatches(ctx)) as {
+      watches: { filter: Record<string, unknown>; since_seq: number }[];
+    };
+    expect(listed.watches[0]?.filter).toEqual({
+      guild_id: GUILD_ID,
+      channel_id: GENERAL,
+    });
+    expect(listed.watches[0]?.since_seq).toBe(3);
+
+    // The wall-clock sibling round-trips the same way.
+    const sinceWatch = expectOk(
+      createWatch(ctx, { name: "since-w", since: "2026-10-01T00:00:00.000Z" }),
+    ) as { filter: Record<string, unknown>; since: string };
+    expect(sinceWatch.filter).toEqual({});
+    expect(sinceWatch.since).toBe("2026-10-01T00:00:00.000Z");
+  });
+
+  it("flags ring eviction in read_watch instead of truncating silently", async () => {
+    const ctx = makeContext({
+      config: loadConfig({
+        DISCORD_BOT_TOKEN: "unit-test-token",
+        WARDEN_MAX_EVENTS: "3",
+      }),
+    });
+    createWatch(ctx, { name: "w" });
+    emitMessage(ctx, makeMessage(ctx));
+    expectOk(await readWatch(ctx, { watch_id: "w" })); // cursor at seq 1
+
+    // The ring holds only the newest 3 — seq 2 was evicted unseen.
+    for (let i = 0; i < 4; i++) emitMessage(ctx, makeMessage(ctx));
+    const result = await readWatch(ctx, { watch_id: "w" });
+    const data = expectOk(result) as { events: unknown[] };
+    expect(data.events).toHaveLength(3);
+    expect(result.ok && result.notes?.[0]).toMatch(/evicted from the ring/);
   });
 });
