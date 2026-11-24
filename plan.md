@@ -622,6 +622,98 @@ Legend: 🟢 read-only · 🔴 mutation (preflight + optional `dry_run`) · all 
 implementation lands us ~59–63. Each tool schema carries a one-line description written for
 *agents* (what it does, which permission it needs, common failure modes).
 
+> **Phase 6 implementation notes** (the read half of this catalog — 8 → 17 registered tools):
+>
+> * **Shipped exactly the 🟢 halves**: `get_audit_log`, `manage_channel` (list|get),
+>   `manage_thread` (list|list_archived|get_member), `manage_role` (list), `list_members`,
+>   `get_member`, `get_user`, `get_messages`, `search_messages`. Every 🔴 action is its
+>   later phase (7–10); `get_poll_results` is Phase 7's. Reads run no §6 preflight but do
+>   use §6's resolvers, so an unknown guild/channel is the same structured `not_found`
+>   a mutation would give.
+> * **`readOk()` vs `ok()` (§4)**: every read success deep-scrubs *all* payload strings —
+>   data **and** notes — then returns; `ok()` deliberately does not scrub, because success
+>   payloads are meant to carry already-curated serializer output. Tests pin a
+>   token-shaped channel topic / role name / message body coming out redacted on each new
+>   read path. `attempt()` wraps every REST call so a throw lands as the uniform
+>   `WardenError`, never as "the tool threw".
+> * **`list_members` reads the gateway cache, `query` goes to REST** — `role_id`,
+>   `in_voice` and `online` are cache-only predicates (Discord's list endpoint filters on
+>   none of them). The partial-cache and cache-filter disclosures live in `notes`, which
+>   is *mandatory* here: tests caught the array being built and never handed to `readOk`,
+>   which would report a short list as complete — the exact failure the module header
+>   forbids.
+> * **One snowflake comparator for every id order** — `compareSnowflakes` in
+>   `shared/ids.ts` (length-first, then lexicographic). The review caught the bug it
+>   exists for: `list_members` sorted length-first but filtered `after` lexicographically,
+>   so a page whose cursor started with a high digit silently dropped every id of a
+>   different length — an agent reads that hole as "no more members". Sort *and* filter
+>   (and `byNewest`, `newestFirst`, the search-path sort) now share it.
+> * **Cursors are two shapes** (`optionalCursor`, the third zod field builder): a
+>   snowflake for message/audit paging, an ISO8601 `archive_timestamp` for the
+>   archived-thread routes — Discord does not agree with itself. `parseCursorTime` proves
+>   *validity*, not just shape: `Date.parse` rolls impossible dates forward
+>   (`2024-02-30` → March 1) and returns NaN otherwise, and the conversion ran outside
+>   `attempt()` where a throw would escape unstructured.
+> * **`list_archived` answers two discord.js traps in the payload** (file header has the
+>   source): `before` is resolved by hand because discord.js *drops* an id it cannot
+>   cache-lookup (`if (toUse) query.set(...)`) — a restart-era cursor would re-serve page
+>   one forever, so a miss is an `invalid_input` naming `archiveTimestamp` instead; and
+>   `private` passes `fetchAll: true` because the default route only lists threads the
+>   *bot* joined. Results keep Discord's `archive_timestamp`-desc order (not id order —
+>   the last element must be the page minimum) and carry `nextBefore` for paging.
+> * **`get_audit_log` forwards `executorId` explicitly** — the serializer falls back to
+>   the executor *object*, which is null for a user discord.js could not resolve; the id
+>   is the one field whose job is "who did this" surviving a partial user. A review-found
+>   regression test pins both directions (executor present / absent).
+> * **`search_messages` is a raw-route adapter**: Discord has no discord.js wrapper for
+>   guild search, so `toMessageLike` maps wire `APIMessage` → the structural shape the
+>   existing serializers read (one mapping, one caller). `hits` are flat messages —
+>   installed `discord-api-types` documents that a group's "surrounding context is no
+>   longer returned", so match-vs-context is decided by the wire's `hit` marker when
+>   present, never by position. `doing_deep_historical_index` becomes a note (partial
+>   results must not read as complete), and the 202 index-not-ready body is a *success*
+>   with `ready: false` + retry delay, not a failure and not "no matches".
+> * **Test shape**: `test/read-tools.test.ts` stubs each REST read at its narrowest seam
+>   (`rest.get`, `members.search`, `users.fetch`, `threads.fetchArchived`) against real
+>   discord.js objects from `test/fixtures.ts` (extracted so both tool suites share one
+>   guild world). The `list_archived` cursor tests exist because discord.js silently
+>   drops a bad `before` — a happy-path suite would never notice.
+
+> **Phase 6 re-review notes** (two review passes; each caught defect pinned by a test):
+>
+> * **The `after` pagination blocker**: `list_members` sorted length-first but filtered
+>   lexicographically — a page whose cursor began with a high digit dropped every id of a
+>   different length, reading as "end of list". `compareSnowflakes` (`shared/ids.ts`) is
+>   now the one comparator for every id sort *and* filter; the regression test pages an
+>   18-digit cursor past a 19-digit member.
+> * **A shape-valid cursor could still throw**: `isCursor` proves shape, not date —
+>   `Date.parse` rolls `2024-02-30` forward and answers NaN otherwise, and the conversion
+>   ran outside `attempt()` where a `RangeError` escapes unstructured. `parseCursorTime`
+>   does the round-trip check; both failure shapes assert `invalid_input` with the REST
+>   spy never called.
+> * **`list_archived`'s own note broke its paging contract**: results were re-sorted by
+>   id while the note told agents to page by `archiveTimestamp` — the last element was
+>   not the page minimum. Archive-desc order plus an explicit `nextBefore` field, and the
+>   `list` "page is full" note now fires only on *truncation* (`matching > returned`),
+>   never on a page that merely happens to be full.
+> * **`search_messages` claimed context Discord no longer sends**: the installed types
+>   document "surrounding context is no longer returned", so hits are flat messages with
+>   the wire's `hit` marker preferred *per group* — a global marker rule would silently
+>   drop unmarked groups, the blocker's shape again. `doing_deep_historical_index`
+>   became a note instead of being ignored.
+> * **A comment claimed microsecond cursor preservation the wire never gets**: discord.js'
+>   `fetchArchived` re-encodes any non-snowflake `before` with `toISOString()`. Warden
+>   passes cursors through untouched, but the ms ceiling sits at the library boundary —
+>   the comments now say exactly that.
+> * **Verdict**: round 1 REQUEST CHANGES (1 blocker + 5 should-fix) → all resolved →
+>   round 2 **APPROVE WITH FIXES** (no blockers), its remaining items fixed above.
+> * **§12 done-when met**: schema introspection green (17-tool canary + §11 tests) and
+>   **live reads verified** against a real guild — every Phase 6 read answered with data
+>   (channels, threads, roles, members, member/user, messages with the full-page note,
+>   audit entries with executor ids), search seen in *both* its 202-indexing state and
+>   `ready:true` (3756 results), `list_archived` exercised on a real parent, and
+>   `get_member` returning §6's `target_protected` self-refusal live.
+
 ---
 
 ## 9. Error model (single source of truth)

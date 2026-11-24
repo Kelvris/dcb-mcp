@@ -33,6 +33,7 @@
  * URL would be just as bad because it embeds the token.
  */
 
+export * from "./audit.js";
 export * from "./channels.js";
 export * from "./guilds.js";
 export * from "./members.js";

@@ -1,6 +1,6 @@
 /**
  * The tool layer's shared runtime: the context every tool module receives,
- * the `ToolResult` → MCP envelope conversion, and the two zod field builders
+ * the `ToolResult` → MCP envelope conversion, and the zod field builders
  * that keep input schemas consistent across ~60 tools.
  *
  * ## Why one envelope converter
@@ -23,11 +23,13 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import type { WardenDiscord } from "../discord/client.js";
-import { scrub } from "../discord/errors.js";
+import { scrub, toWardenError } from "../discord/errors.js";
+import type { WardenError } from "../discord/errors.js";
 import type { Config } from "../config.js";
 import type { EventRuntime } from "../events/index.js";
 import type { Logger } from "../logger.js";
 import { SNOWFLAKE } from "../shared/ids.js";
+import { ok } from "../shared/result.js";
 import type { ToolResult } from "../shared/result.js";
 
 /**
@@ -60,13 +62,83 @@ export interface ToolContext {
  * name instead of an id.
  */
 export function optionalId(description: string): z.ZodOptional<z.ZodString> {
+  return requiredId(description).optional();
+}
+
+/**
+ * Required snowflake argument (`user_id`, …) — same validation as
+ * {@link optionalId}, minus the optional: a tool whose whole job is "look up
+ * this one thing" must not compile a call that omits it.
+ */
+export function requiredId(description: string): z.ZodString {
   return z
     .string()
     .regex(SNOWFLAKE, {
       error: "must be a Discord snowflake id (17-20 digits)",
     })
+    .describe(description);
+}
+
+/**
+ * ISO8601 UTC exactly as Discord writes it (`2024-01-31T12:00:00.000Z`) —
+ * the shape the archived-thread routes page by. Private to this module so the
+ * schema check below is the only definition of it.
+ */
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
+
+/**
+ * Is `value` shaped like a paged cursor?
+ *
+ * Discord does not agree with itself on what a cursor *is*: message history
+ * and the audit log step by snowflake, the archived-thread routes step by an
+ * ISO8601 `archive_timestamp`. An agent paging a list hands back whatever the
+ * previous page gave it, so both shapes are accepted rather than only the id
+ * shape that {@link optionalId} enforces.
+ *
+ * Exported because the tool that *consumes* the cursor branches on the same
+ * two shapes — one predicate keeps the schema and that branch from drifting.
+ */
+export function isCursor(value: string): boolean {
+  return SNOWFLAKE.test(value) || ISO_UTC.test(value);
+}
+
+/**
+ * Optional cursor argument (`before` on a paged read) — see {@link isCursor}
+ * for why this is a third builder instead of a reuse of {@link optionalId}.
+ */
+export function optionalCursor(
+  description: string,
+): z.ZodOptional<z.ZodString> {
+  return z
+    .string()
+    .refine(isCursor, {
+      error:
+        "must be a Discord snowflake id (17-20 digits) or an ISO8601 UTC timestamp (2024-01-31T12:00:00.000Z)",
+    })
     .describe(description)
     .optional();
+}
+
+/**
+ * Epoch milliseconds for an ISO8601 cursor, or `null` when the string names
+ * no real instant.
+ *
+ * Shape ({@link isCursor}) is not validity. `Date.parse` *rolls* impossible
+ * dates forward instead of failing — `2024-02-30` becomes March 1, which
+ * would move a page boundary without telling anyone — and answers `NaN` for
+ * the genuinely unparseable, which `toISOString()` then throws on. The round
+ * trip below rejects both: the instant the string parses to must be the
+ * instant the string *says* it names. The fraction is excluded from the
+ * comparison because the shape check already proved it digits (nothing in it
+ * can be invalid), while every component that can lie is compared.
+ */
+export function parseCursorTime(value: string): number | null {
+  if (!ISO_UTC.test(value)) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  const said = value.replace(/\.\d+Z$/, "Z");
+  const named = new Date(parsed).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return said === named ? parsed : null;
 }
 
 /**
@@ -89,6 +161,87 @@ export function scrubText<T extends string | null | undefined>(value: T): T {
   // `string | null | undefined`.
   return scrub(value) as T;
 }
+
+/** Depth past which a nested container is replaced instead of descended into. */
+const MAX_SCRUB_DEPTH = 8;
+
+function scrubValue(value: unknown, depth: number): unknown {
+  if (typeof value === "string") return scrub(value);
+  if (value === null || typeof value !== "object") return value;
+  // The cap terminates: a payload built by the serializers is a tree, but a
+  // future tool could hand back something self-referential, and an unbounded
+  // walk would spin forever on data that only ever needs masking at its
+  // leaves. Leaves are scrubbed *before* the cap is consulted, so depth
+  // never exempts content — the same trade `errors.ts: redactDeep` makes.
+  if (depth >= MAX_SCRUB_DEPTH) return "[depth-limit]";
+  if (Array.isArray(value)) {
+    return value.map((entry) => scrubValue(entry, depth + 1));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = scrubValue(entry, depth + 1);
+  }
+  return out;
+}
+
+/**
+ * Deep-scrub every string leaf of a payload destined for a **success**
+ * result (plan §4).
+ *
+ * `ok()` deliberately does not scrub (shared/result.ts) because the
+ * serializers already curate *shape* — and Phase 6 is where that stops being
+ * enough. A channel topic, a role name, a nickname, a message body and an
+ * audit-log reason are all operator/user free text that arrives *from
+ * Discord*, so no per-field `scrubText()` call at the call site can be
+ * forgotten: the read tools pass their whole serialized payload through
+ * here once, on the way out.
+ */
+export function scrubData<T>(value: T): T {
+  return scrubValue(value, 0) as T;
+}
+
+/**
+ * `ok()` for a payload built out of Discord objects.
+ *
+ * Scrubs the data *and* the notes (a note quoting a role name carries the
+ * same free text the payload does), so "did this tool scrub?" has exactly
+ * one answer for every read tool instead of one per field.
+ */
+export function readOk<T>(
+  performed: string,
+  data: T,
+  notes?: readonly string[],
+): ToolResult {
+  const safeNotes = notes?.map((note) => scrub(note));
+  return ok(performed, scrubData(data), safeNotes);
+}
+
+/**
+ * Run a call that may throw (every REST-backed read: `fetchAuditLogs`,
+ * `messages.fetch`, `members.search`, a raw `client.rest.get`) and map a
+ * throw onto the uniform failure contract instead of letting it escape into
+ * the SDK.
+ *
+ * `guards.ts` is the primary translator (plan §6) and `errors.ts` the safety
+ * net behind it (plan §9) — but the safety net only runs if something feeds
+ * it the thrown value. Without this seam a 404 or a 50013 from a read would
+ * surface as an SDK-level "tool threw" rather than the structured
+ * `{error, message, remediation}` every Warden failure uses.
+ *
+ * Mirrors the guards' resolver convention: returns `T | WardenError`, so a
+ * caller narrows with `isWardenError()` exactly as it does after
+ * `resolveGuild()`.
+ */
+export async function attempt<T>(
+  operation: () => Promise<T> | T,
+): Promise<T | WardenError> {
+  try {
+    return await operation();
+  } catch (error) {
+    return toWardenError(error);
+  }
+}
+
 
 /**
  * The uniform envelope (plan §5). Every tool's callback ends here.

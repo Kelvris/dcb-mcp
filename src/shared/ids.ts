@@ -15,3 +15,21 @@ export const SNOWFLAKE = /^\d{17,20}$/;
 export function isSnowflake(value: string): boolean {
   return SNOWFLAKE.test(value);
 }
+
+/**
+ * Order two ids the way the id *space* orders them: by digit length first,
+ * then lexicographically within a length (equal-length digit strings compare
+ * numerically that way).
+ *
+ * Plain string comparison is wrong across lengths and plain length-first
+ * comparison is wrong within them — and mixing them is worse than either: a
+ * length-first sort paired with a lexicographic filter drops every id whose
+ * length differs from the cursor whenever its first digit is lower (`19`-digit
+ * id vs an `7…`-digit cursor), which an agent reads as "the list ended" rather
+ * than as a hole. Every sort *and* filter over ids must use this one.
+ */
+export function compareSnowflakes(a: string, b: string): number {
+  if (a.length !== b.length) return a.length - b.length;
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}

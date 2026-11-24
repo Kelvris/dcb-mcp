@@ -13,29 +13,18 @@
  *    tools is to agree with what discord.js reports, so doubles that merely
  *    repeat our own assumptions would test nothing.
  *
- * The fixtures here are intentionally smaller than `guards.test.ts`'s — that
- * suite needs the full hierarchy matrix; this one needs one bot, one role
- * above it, two channels and a thread.
+ * The shared one-guild world these suites run against (ids, raw payloads,
+ * `makeContext`, `expectOk`/`expectFailure`, `registeredNames`) lives in
+ * `fixtures.ts` — Phase 6 gave `read-tools.test.ts` the same world, and two
+ * suites duplicating a role-position matrix would drift apart silently.
  */
 
-import type { Client, OmitPartialGroupDMChannel } from "discord.js";
-import {
-  Client as DiscordClient,
-  ClientUser,
-  Events,
-  Guild,
-  Message,
-} from "discord.js";
-import { McpServer } from "@modelcontextprotocol/server";
+import type { OmitPartialGroupDMChannel } from "discord.js";
+import { Events, Message } from "discord.js";
 import { describe, expect, it } from "vitest";
 
 import { loadConfig } from "../src/config.js";
-import type { Config } from "../src/config.js";
-import { WardenNotReadyError } from "../src/discord/errors.js";
-import type { WardenError } from "../src/discord/errors.js";
 import { createLogger } from "../src/logger.js";
-import { registerAll } from "../src/tools/index.js";
-import { createEventRuntime } from "../src/events/index.js";
 import { createWarden } from "../src/server.js";
 import { getServer } from "../src/tools/guild.js";
 import type { ServerOverview } from "../src/tools/guild.js";
@@ -51,261 +40,50 @@ import {
 import type { BotStatusData } from "../src/tools/observe.js";
 import { scrubText, toCallToolResult } from "../src/tools/context.js";
 import type { ToolContext } from "../src/tools/context.js";
-import type { WardenDiscord } from "../src/discord/client.js";
 import { fail, ok } from "../src/shared/result.js";
-import type { ToolResult } from "../src/shared/result.js";
 
-// ---------------------------------------------------------------------------
-// ids & fixture
-// ---------------------------------------------------------------------------
-
-const BOT_ID = "200000000000000001";
-const OWNER_ID = "100000000000000001";
-const MEMBER_ID = "100000000000000002";
-const GUILD_ID = "300000000000000001";
-const OTHER_GUILD_ID = "300000000000000002";
-const WARDEN_ROLE = "300000000000000012";
-const MOD_ROLE = "300000000000000013";
-const GENERAL = "400000000000000001";
-const VOICE = "400000000000000004";
-const THREAD = "400000000000000005";
-
-/** discord.js marks structure constructors `private`/`protected`. */
-function construct<T>(Ctor: unknown, ...args: readonly unknown[]): T {
-  return new (Ctor as new (...args: unknown[]) => T)(...args);
-}
-
-function rawGuild() {
-  return {
-    id: GUILD_ID,
-    name: "Test Guild",
-    owner_id: OWNER_ID,
-    verification_level: 1,
-    // Deliberately token-shaped (plan §4): `get_server` must not pass this
-    // through — free text is exactly where an operator pastes a secret.
-    description:
-      "deploy with ABCDEFGHIJKLMNOPQRSTUVWXYZabcd.12345678." +
-      "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF now",
-    // Same default @everyone bitfield guards.test.ts uses: it deliberately
-    // lacks ManageGuild/ManageRoles/ManageMessages/Kick/Ban/ModerateMembers,
-    // which is what makes the "missing …" blockers observable.
-    roles: [
-      {
-        id: GUILD_ID,
-        name: "@everyone",
-        position: 0,
-        permissions: "104320577",
-        color: 0,
-        hoist: false,
-        mentionable: false,
-      },
-      {
-        id: WARDEN_ROLE,
-        name: "Warden",
-        position: 1,
-        permissions: "0",
-        color: 0,
-        hoist: false,
-        mentionable: false,
-        managed: false,
-      },
-      {
-        // Sits above Warden — the one role a mutation cannot touch, and the
-        // blocker `get_bot_status` must surface up front.
-        id: MOD_ROLE,
-        name: "Moderator",
-        position: 2,
-        permissions: "0",
-        color: 0,
-        hoist: false,
-        mentionable: false,
-        managed: false,
-      },
-    ],
-    channels: [
-      {
-        id: GENERAL,
-        type: 0,
-        name: "general",
-        position: 0,
-        topic: "talk here",
-        permission_overwrites: [],
-      },
-      {
-        id: VOICE,
-        type: 2,
-        name: "voice",
-        position: 1,
-        bitrate: 64000,
-        user_limit: 10,
-        permission_overwrites: [],
-      },
-    ],
-    threads: [
-      {
-        id: THREAD,
-        type: 11,
-        name: "thread",
-        owner_id: OWNER_ID,
-        parent_id: GENERAL,
-        message_count: 0,
-        total_message_sent: 0,
-        flags: 0,
-        member_count: 1,
-        thread_metadata: { archived: false, auto_archive_duration: 1440 },
-        last_message_id: null,
-      },
-    ],
-    members: [
-      {
-        user: { id: BOT_ID, username: "warden", discriminator: "0", bot: true },
-        roles: [WARDEN_ROLE],
-        joined_at: "2024-01-01T00:00:00.000Z",
-      },
-      {
-        user: { id: OWNER_ID, username: "alice", discriminator: "0" },
-        roles: [],
-        joined_at: "2024-01-01T00:00:00.000Z",
-      },
-      {
-        user: { id: MEMBER_ID, username: "bob", discriminator: "0" },
-        roles: [],
-        joined_at: "2024-01-01T00:00:00.000Z",
-      },
-    ],
-    member_count: 3,
-    unavailable: false,
-  };
-}
-
-function makeClient(): Client {
-  const client = new DiscordClient({ intents: [] });
-  (client as unknown as { user: ClientUser | null }).user =
-    construct<ClientUser>(ClientUser, client, {
-      id: BOT_ID,
-      username: "warden",
-      discriminator: "0",
-      bot: true,
-    });
-  const guild = construct<Guild>(Guild, client, rawGuild());
-  client.guilds.cache.set(guild.id, guild);
-  return client;
-}
-
-/** Minimal `WardenDiscord` over a fixed client — status reflects `ready`. */
-function fakeDiscord(
-  client: Client,
-  ready: boolean,
-  fatal: { reason: string; remediation: string } | null = null,
-): WardenDiscord {
-  return {
-    client,
-    isReady: () => ready,
-    waitForReady: () =>
-      ready
-        ? Promise.resolve()
-        : Promise.reject(new WardenNotReadyError("not ready")),
-    status: () => ({
-      ready,
-      wsStatus: ready ? "Ready" : "Connecting",
-      wsPingMs: ready ? 42 : null,
-      readyAt: ready ? "2026-01-01T00:00:00.000Z" : null,
-      guildCount: client.guilds.cache.size,
-      user: client.user
-        ? {
-            id: client.user.id,
-            username: client.user.username,
-            discriminator: client.user.discriminator,
-          }
-        : null,
-      reconnects: 0,
-      disconnects: 0,
-      lastCloseCode: null,
-      fatal,
-    }),
-    login: () => Promise.resolve(),
-    destroy: () => Promise.resolve(),
-  };
-}
-
-function makeContext(
-  options: {
-    ready?: boolean;
-    config?: Config;
-    fatal?: { reason: string; remediation: string } | null;
-  } = {},
-): ToolContext {
-  const client = makeClient();
-  const config =
-    options.config ?? loadConfig({ DISCORD_BOT_TOKEN: "unit-test-token" });
-  const logger = createLogger("error", () => {});
-  return {
-    config,
-    logger,
-    discord: fakeDiscord(client, options.ready ?? true, options.fatal ?? null),
-    // Phase 5: the event runtime over the same client — tests drive it with
-    // `client.emit(...)` exactly as discord.js would dispatch.
-    events: createEventRuntime(
-      client,
-      { maxEvents: config.WARDEN_MAX_EVENTS, maxWatches: config.WARDEN_MAX_WATCHES },
-      logger,
-    ),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// result helpers
-// ---------------------------------------------------------------------------
-
-function expectOk(result: ToolResult): Record<string, unknown> {
-  if (!result.ok) {
-    throw new Error(`expected ok, got ${result.error}: ${result.message}`);
-  }
-  return result.data as Record<string, unknown>;
-}
-
-function expectFailure(result: ToolResult): WardenError {
-  if (result.ok) throw new Error(`expected a failure, got ${result.performed}`);
-  return result;
-}
-
-/**
- * White-box read of the SDK's registry: the SDK exposes no public accessor
- * for registered tools (only `toolInputSchemaJson`), so this is the only
- * introspection seam — and it fails *loudly* if the SDK renames the field.
- * Driving a full client over InMemoryTransport would test the SDK's dispatch,
- * not this module's wiring.
- */
-function registeredNames(server: McpServer): string[] {
-  const tools = (
-    server as unknown as {
-      _registeredTools: Record<string, unknown>;
-    }
-  )._registeredTools;
-  return Object.keys(tools).sort();
-}
+import {
+  BOT_ID,
+  GENERAL,
+  GUILD_ID,
+  MEMBER_ID,
+  MOD_ROLE,
+  OTHER_GUILD_ID,
+  OWNER_ID,
+  VOICE,
+  WARDEN_ROLE,
+  construct,
+  expectFailure,
+  expectOk,
+  makeContext,
+  newServer,
+  registeredNames,
+} from "./fixtures.js";
 
 // ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
 
-function newServer(): McpServer {
-  const server = new McpServer({ name: "test", version: "0.0.0" });
-  registerAll(server, makeContext());
-  return server;
-}
-
-describe("registerAll — the phase-4/5 registry", () => {
+describe("registerAll — the phase-4/5/6 registry", () => {
   it("registers exactly the tools this phase ships", () => {
     // A deliberate canary, not a complete-catalog assertion: each later phase
     // adds its domain here (the plan expects ~59–63 tools by Phase 10), and a
     // failure is the prompt to update this list, not to "fix" the test.
     expect(registeredNames(newServer())).toEqual([
+      "get_audit_log",
       "get_bot_status",
       "get_events",
+      "get_member",
+      "get_messages",
       "get_server",
+      "get_user",
+      "list_members",
       "list_watches",
+      "manage_channel",
+      "manage_role",
+      "manage_thread",
       "read_watch",
+      "search_messages",
       "unwatch",
       "wait_for_event",
       "watch",
