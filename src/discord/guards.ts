@@ -651,6 +651,17 @@ export const LIMITS = {
   emojiBytes: 256 * 1024,
   /** Sticker uploads — api docs: "max 512 KiB". */
   stickerBytes: 512 * 1024,
+  /**
+   * Message attachments, per file (a plain number like `bulkDeleteAgeMs`,
+   * because `checkFileSize` takes the ceiling directly).
+   *
+   * Discord's documented default upload limit, tier 0 — raised from 10 MiB to
+   * 20 MiB for users, bots, webhooks and interaction responses alike, and
+   * higher still on boosted servers (tiers 1–3). Warden checks the *default*
+   * so an oversized file is refused before a round-trip; Discord enforces the
+   * server's actual tier on the way in regardless.
+   */
+  attachmentBytes: 20 * 1024 * 1024,
   /** Soundboard uploads — api docs: "max file size 512kb, max duration 5.2 seconds". */
   soundboardBytes: 512 * 1024,
   soundboardDurationMs: 5200,

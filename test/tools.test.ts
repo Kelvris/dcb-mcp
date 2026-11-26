@@ -70,20 +70,28 @@ describe("registerAll — the phase-4/5/6 registry", () => {
     // adds its domain here (the plan expects ~59–63 tools by Phase 10), and a
     // failure is the prompt to update this list, not to "fix" the test.
     expect(registeredNames(newServer())).toEqual([
+      "bulk_delete_messages",
+      "crosspost_message",
+      "delete_message",
+      "edit_message",
       "get_audit_log",
       "get_bot_status",
       "get_events",
       "get_member",
       "get_messages",
+      "get_poll_results",
       "get_server",
       "get_user",
       "list_members",
       "list_watches",
       "manage_channel",
+      "manage_pins",
+      "manage_reactions",
       "manage_role",
       "manage_thread",
       "read_watch",
       "search_messages",
+      "send_message",
       "unwatch",
       "wait_for_event",
       "watch",
@@ -139,7 +147,7 @@ describe("registerAll — the phase-4/5/6 registry", () => {
     expect(withGuildId).toBeGreaterThanOrEqual(5);
   });
 
-  it("marks every tool read-only except the watch-slot mutation", () => {
+  it("marks every tool read-only except the mutations", () => {
     const server = newServer();
     const tools = (
       server as unknown as {
@@ -149,10 +157,23 @@ describe("registerAll — the phase-4/5/6 registry", () => {
         >;
       }
     )._registeredTools;
+    // The write half: `unwatch` (🔴*, a state change that never touches
+    // Discord) plus Phase 7's message mutations. `get_poll_results` and
+    // `manage_pins`/`manage_reactions`' `list`/`get_reaction_users` actions
+    // are reads *inside* a mutating tool — the annotation is per tool, so a
+    // tool that can write anywhere says so.
+    const mutations = new Set([
+      "unwatch",
+      "send_message",
+      "edit_message",
+      "delete_message",
+      "bulk_delete_messages",
+      "crosspost_message",
+      "manage_pins",
+      "manage_reactions",
+    ]);
     for (const name of registeredNames(server)) {
-      // §8.1's legend: everything in the observe group is 🟢 except
-      // `unwatch` (🔴*, a state change that never touches Discord).
-      const expected = name !== "unwatch";
+      const expected = !mutations.has(name);
       expect(tools[name]?.annotations?.readOnlyHint, name).toBe(expected);
     }
   });
